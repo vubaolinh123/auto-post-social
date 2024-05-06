@@ -3,7 +3,6 @@
     "version": "1.0.0",
     "description": "",
     "main": "src/index.js",
-    "type":"module",
     "scripts": {
         "start": "nodemon --max-old-space-size=4096 src/index.js localhost 8080 --exec babel-node -e js"
     },

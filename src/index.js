@@ -4,9 +4,9 @@ import morgan from "morgan";
 import mongoose from "mongoose";
 import passport from "passport";
 import session from "express-session";
-import twitterRouter from "./routers/twitter";
-import tumblrRouter from "./routers/tumblr";
-import facebookRouter from "./routers/facebook"
+import twitterRouter from "./routers/twitter.js";
+import tumblrRouter from "./routers/tumblr.js";
+import facebookRouter from "./routers/facebook.js"
 
 require("./config/auth")(passport); 
 require("./scheduler");
