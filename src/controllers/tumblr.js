@@ -1,9 +1,6 @@
 import axios from "axios";
-import qs from "qs";
 const crypto = require("crypto");
 import FormData from "form-data";
-import fs from "fs";
-import https from "https";
 require("dotenv").config();
 
 export const requestToken = async (req, res) => {
@@ -60,117 +57,66 @@ export const getToken = async (req, res) => {
   }
 };
 
-// const postData = {
-//   type: "text",
-//   title: "Hello World",
-//   body: 'Welcome to my world'
-// };
 
 export const schedulePostTumblr = async (req, res) => {
+  if (res.headersSent) return; 
+
   const url = `https://api.tumblr.com/v2/blog/${req.body.username}/post`;
+  const { type: postType, media: mediaSources, accessToken } = req.body; 
 
-  const postType = req.body.type;
-  const mediaSources = req.body.media;
-
-  const headers = {
-    Authorization: `Bearer ${req.body.accessToken}`,
-  };
-
-  const downloadVideo = async (videoUrl) => {
-    const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
-    return Buffer.from(response.data);
-  };
-
-  const formData = new FormData();
-  formData.append("type", req.body.type); 
-  formData.append("caption", req.body.caption || "Posting to Tumblr!");
-
-  if (postType === "photo") {
-    formData.append("tags", req.body.tags || "photo, tumblr");
-    for (const [index, imageUrl] of mediaSources.entries()) {
-      const imageResponse = await axios.get(imageUrl, {
-        responseType: "arraybuffer",
-      });
-      formData.append(`data[${index}]`, Buffer.from(imageResponse.data), {
-        filename: `image${index}.jpg`,
-      });
-    }
-  } else if (postType === "video") {
-    try {
-      const videoBuffer = await downloadVideo(req.body.media);
-      formData.append("data", videoBuffer, { filename: "video.mp4" });
-
-      const response = await axios.post(url, formData, {
-        headers: { ...headers, ...formData.getHeaders() },
-      });
-
-      res.json({
-        message: "Successfully posted a video to Tumblr.",
-        response: response.data,
-      });
-    } catch (error) {
-      console.error(
-        "Failed to post to Tumblr:",
-        error.response ? error.response.data : error.message
-      );
-      res
-        .status(500)
-        .send(
-          "Failed to post to Tumblr: " +
-            (error.response ? error.response.data : error.message)
-        );
-    }
-  }else if(postType === "text"){
-    try {
-      formData.append("title", req.body.title || "Title Tumblr");
-      formData.append("body", req.body.body || "Body Tumblr");
-
-      const response = await axios.post(url, formData, {
-        headers: { ...headers, ...formData.getHeaders() },
-      });
-
-      res.json({
-        message: "Successfully posted a text to Tumblr.",
-        response: response.data,
-      });
-    } catch (error) {
-      console.error(
-        "Failed to post to Tumblr:",
-        error.response ? error.response.data : error.message
-      );
-      res
-        .status(500)
-        .send(
-          "Failed to post to Tumblr: " +
-            (error.response ? error.response.data : error.message)
-        );
-    }
-  } else {
-    return res
-      .status(400)
-      .send("Invalid post type. It must be either photo or video.");
-  }
+  const headers = { Authorization: `Bearer ${accessToken}` };
 
   try {
-    const response = await axios.post(url, formData, {
-      headers: { ...headers, ...formData.getHeaders() },
-    });
+    const formData = new FormData();
+    formData.append("type", postType);
+    formData.append("caption", req.body.caption || "Posting to Tumblr!");
 
-    res.json({
-      message: `Successfully posted a ${postType} to Tumblr.`,
-      response: response.data,
-    });
+    switch (postType) {
+      case "photo":
+        await handlePhotoPost(req, formData);
+        break;
+      case "video":
+        await handleVideoPost(req, formData);
+        break;
+      case "text":
+        handleTextPost(req, formData);
+        break;
+      default:
+        throw new Error("Invalid post type. It must be either photo, video, or text.");
+    }
+
+    const response = await axios.post(url, formData, { headers: { ...headers, ...formData.getHeaders() } });
+    res.json({ message: `Successfully posted a ${postType} to Tumblr.`, response: response.data });
+
   } catch (error) {
-    console.error(
-      "Failed to post to Tumblr:",
-      error.response ? error.response.data : error.message
-    );
-    res
-      .status(500)
-      .send(
-        "Failed to post to Tumblr: " +
-          (error.response ? error.response.data : error.message)
-      );
+    const errorMessage = error.response ? JSON.stringify(error.response.data, null, 2) : error.message;
+    console.error("Failed to post to Tumblr:", errorMessage);
+    if (!res.headersSent) {
+      res.status(500).send(`Failed to post to Tumblr: ${errorMessage}`);
+    }
   }
 };
 
+const handlePhotoPost = async (req, formData) => {
+  const mediaSources = Array.isArray(req.body.media) ? req.body.media : [req.body.media];
+  formData.append("tags", req.body.tags || "photo, tumblr");
+  for (let index = 0; index < mediaSources.length; index++) {
+    const imageUrl = mediaSources[index];
+    const imageResponse = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    formData.append(`data[${index}]`, Buffer.from(imageResponse.data), { filename: `image${index}.jpg` });
+  }
+};
+
+const handleVideoPost = async (req, formData) => {
+  if (typeof req.body.media === 'string') {
+    const videoResponse = await axios.get(req.body.media, { responseType: "arraybuffer" });
+    formData.append("data", Buffer.from(videoResponse.data), { filename: "video.mp4" });
+  } else {
+    throw new Error("Video URL is not provided or invalid.");
+  }
+};
+
+const handleTextPost = (req, formData) => {
+  formData.append("title", req.body.title || "Title Tumblr");
+  formData.append("body", req.body.body || "Body Tumblr");
+};
