@@ -3,22 +3,35 @@ import fs from 'fs'
 import path from 'path'
 import axios from 'axios';
 
-const download = function (uri, filename, callback) {
-  request.head(uri, function (err, res) {
-    if (err) {
-      return callback(err);
-    }
-    if (res.statusCode !== 200) {
-      return callback(new Error('Failed to download: Server responded with status code ' + res.statusCode));
-    }
-    
-    const customPath = filename ? path.join(filename, path.basename(uri)) : path.basename(uri);
-    const stream = fs.createWriteStream(customPath);
+const download = async (uri, filename, callback) => {
+  if (typeof uri !== 'string' || !uri.trim()) {
+    throw new Error('Invalid URI');
+  }
 
-    request(uri)
-      .pipe(stream)
-      .on("error", callback) 
-      .on("close", callback);
+  const response = await axios({
+    url: uri,
+    method: 'GET',
+    responseType: 'stream'
+  });
+
+  const filePath = path.join(filename, path.basename(uri));
+  const writer = fs.createWriteStream(filePath);
+
+  response.data.pipe(writer);
+
+  writer.on('finish', async () => {
+    try {
+      await callback(filePath);
+    } finally {
+      fs.unlink(filePath, (err) => {
+        if (err) console.error('Error deleting the file:', err);
+        else console.log('File deleted successfully');
+      });
+    }
+  });
+
+  writer.on('error', (err) => {
+    console.error('Error downloading the file:', err);
   });
 };
 

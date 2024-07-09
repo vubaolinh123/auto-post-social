@@ -1,8 +1,13 @@
 require('dotenv').config();
-import { download } from "./utilities";
-import path from "path";
+import mime from 'mime-types';
 import Twitter from '../models/twitterSchedule'; 
-import {authApiTwitterClient} from "../config/twitterClient";
+import axios from "axios";
+import { TwitterApi } from "twitter-api-v2";
+
+const clientId = process.env.CLIENT_ID;
+const clientSecret = process.env.CLIENT_SECRET;
+const redirectUri = process.env.REDIRECT_URL;
+
 
 export const listDataScheduleTwitter = async (req, res) => {
   try {
@@ -60,8 +65,41 @@ export const getOneDataScheduleTwitter = async (req, res) => {
   }
 }
 
+
+const refreshAccessToken = async (refreshToken) => {
+  try {
+    const response = await axios.post('https://api.twitter.com/oauth2/token', new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: clientId,
+      client_secret: clientSecret,
+    }), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const newTokenData = response.data;
+
+    if (!newTokenData.access_token) {
+      throw new Error('Failed to refresh access token');
+    }
+
+    await Twitter.updateOne({ refreshToken }, {
+      accessToken: newTokenData.access_token,
+      refreshToken: newTokenData.refresh_token || refreshToken,
+    });
+
+    return newTokenData;
+  } catch (error) {
+    console.error('Error refreshing access token:', error);
+    throw new Error('Could not refresh access token');
+  }
+};
+
+
 export const scheduleTwitter = async (req, res) => {
-    const { accessToken, accessSecret, tweetContent, scheduledTime, urls } = req.body;
+    const { accessToken, accessSecret, tweetContent, scheduledTime, urls, refreshToken } = req.body;
   
     const scheduledDate = new Date(scheduledTime);
   
@@ -69,6 +107,7 @@ export const scheduleTwitter = async (req, res) => {
       const newSchedule = new Twitter({
         accessToken,
         accessSecret,
+        refreshToken,
         tweetContent,
         scheduledTime: scheduledDate,
         imageUrls: urls, 
@@ -83,108 +122,118 @@ export const scheduleTwitter = async (req, res) => {
     }
 };
 
-export const postScheduledTweets = async (req, res) => {
-    const now = new Date();
-  
+
+const postTweet = async (tweet, twitterClient) => {
+  let mediaIds = [];
+
+  for (let image of tweet.imageUrls) {
     try {
-      const tweetsToPost = await Twitter.find({
-        scheduledTime: { $lte: now },
-        posted: false
-      });
-  
+      const response = await axios.get(image.url, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(response.data, 'binary');
+      const mimeType = mime.lookup(image.url); 
 
-      for (const tweet of tweetsToPost) {
-        const twitterClient = await authApiTwitterClient(tweet.accessToken,tweet.accessSecret)
-      
-        try{
-            const filename = "C:Image";
-            let mediaIds = [];
+      if (!mimeType) {
+        throw new Error(`Could not determine MIME type for URL ${image.url}`);
+      }
 
-            if (tweet.imageUrls.length > 1) {
-                for (let i = 0; i < tweet.imageUrls.length; i++) {
-                  download(tweet.imageUrls[i].url, filename, async function () {
-                      const mediaId = await twitterClient.v1.uploadMedia(
-                        path.join(filename, path.basename(tweet.imageUrls[i].url))
-                      );
-                      mediaIds.push(mediaId);
-                      if (mediaIds.length === tweet.imageUrls.length) {
-                        await twitterClient.v2
-                          .tweet({
-                            text: tweet.tweetContent,
-                            media: {
-                              media_ids: mediaIds,
-                            },
-                          })
-                          .then(() => {
-                            console.log(`Đăng bài multiple media thành công Tweet ID: ${tweet._id}`);
-                          });
-                      }
-                  });
-                }
-              } else {
-                download(tweet.imageUrls[0].url, filename, async function () {
-                    const mediaId = await twitterClient.v1.uploadMedia(
-                      path.join(filename, path.basename(tweet.imageUrls[0].url))
-                    );
-                    mediaIds.push(mediaId);
-                    console.log("Upload Media thành công")
-                    if (mediaIds.length === tweet.imageUrls.length) {
-                        console.log("Bắt đầu đăng bài")
-                      await twitterClient.v2
-                        .tweet({
-                          text: tweet.tweetContent,
-                          media: {
-                            media_ids: mediaIds,
-                          },
-                        }).then(() => {
-                          console.log(`Đăng bài single media thành công Tweet ID: ${tweet._id}`);
-                        });
-                    }
-                });
-              }
-            
-          
-          await Twitter.findByIdAndUpdate(tweet._id, { posted: true });
-          console.log(`Tweet ID: ${tweet._id} has been posted.`);
-        } catch (error) {
-          console.error(`Failed to post Tweet ID: ${tweet._id}`, error);
-        }
-    }
+      const mediaId = await twitterClient.v1.uploadMedia(buffer, { mimeType });
+      mediaIds.push(mediaId);
     } catch (error) {
-      console.error('Error in postScheduledTweets:', error);
-      res.status(400).json({ message: `Error in postScheduledTweets` });
+      console.error(`Failed to upload media from URL ${image.url}:`, error);
     }
+  }
+
+  if (mediaIds.length > 0) {
+    try {
+      await twitterClient.v2.tweet({
+        text: tweet.tweetContent,
+        media: {
+          media_ids: mediaIds,
+        },
+      });
+      await Twitter.findByIdAndUpdate(tweet._id, { posted: true });
+      console.log(`Tweet ID: ${tweet._id} has been posted.`);
+    } catch (error) {
+      console.error('Failed to post tweet:', error);
+    }
+  } else {
+    console.error('No media uploaded, tweet not posted.');
+  }
 };
 
+export const postScheduledTweets = async (req, res) => {
+  const now = new Date();
 
-export const TokenTwitter = async (req, res)=>{
-    const { token, verifier } = req.body;
+  try {
+    const tweetsToPost = await Twitter.find({
+      scheduledTime: { $lte: now },
+      posted: false,
+    });
 
-    const consumerKey = process.env.API_KEY;
-    const consumerSecret = process.env.API_KEY_SECRET;
+    for (const tweet of tweetsToPost) {
+      let twitterClient = new TwitterApi({
+        appKey: process.env.API_KEY,
+        appSecret: process.env.API_KEY_SECRET,
+        accessToken: tweet.accessToken,
+        accessSecret: tweet.refreshToken,
+      });
 
-    // Twitter endpoint for exchanging the token and verifier for an access token
-    const tokenExchangeUrl = 'https://api.twitter.com/oauth/access_token';
+      try {
+        await postTweet(tweet, twitterClient);
+      } catch (error) {
+        if (error.response && error.response.status === 401 && error.response.data.error === 'invalid_token') {
+          try {
+            const newTokenData = await refreshAccessToken(tweet.refreshToken);
+            tweet.accessToken = newTokenData.access_token;
+            tweet.refreshToken = newTokenData.refresh_token || tweet.refreshToken;
+            await tweet.save();
 
-    try {
-        const response = await fetch(tokenExchangeUrl, {
-            method: 'POST',
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-                Authorization: `Basic ${Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64')}`,
-            },
-            body: new URLSearchParams({
-                oauth_token: token,
-                oauth_verifier: verifier,
-            }),
-        });
+            twitterClient = new TwitterApi({
+              appKey: process.env.API_KEY,
+              appSecret: process.env.API_KEY_SECRET,
+              accessToken: tweet.accessToken,
+              accessSecret: tweet.refreshToken,
+            });
 
-        const data = await response.text(); 
-
-        res.json({ message: 'Token exchanged successfully', data });
-    } catch (error) {
-        console.error('Error exchanging token:', error);
-        res.status(500).json({ message: 'Failed to exchange token' });
+            await postTweet(tweet, twitterClient);
+          } catch (refreshError) {
+            console.error("Failed to refresh access token and post to Twitter:", refreshError.message);
+          }
+        } else {
+          console.error(`Failed to post Tweet ID: ${tweet._id}`, error);
+        }
+      }
     }
-}
+  } catch (error) {
+    console.error('Error in scheduled job:', error);
+  }
+};
 
+export const TokenTwitter = async (req, res) => {
+  const { oauth_token, oauth_verifier } = req.body;
+
+  try {
+    const twitterClient = new TwitterApi({
+      appKey: process.env.API_KEY,
+      appSecret: process.env.API_KEY_SECRET,
+      accessToken: oauth_token,
+      accessSecret: oauth_verifier
+    });
+
+    // Lấy access token từ Twitter
+    const { client: loggedClient, accessToken, accessSecret } = await twitterClient.login(oauth_verifier);
+
+    res.json({ accessToken, refreshToken: accessSecret });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to authenticate with Twitter' });
+  }
+};
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});

@@ -1,10 +1,11 @@
 import axios from "axios";
 const crypto = require("crypto");
 import FormData from "form-data";
+import Tumblr from '../models/tumblrSchedule';
 require("dotenv").config();
 
 export const requestToken = async (req, res) => {
-  const callbackUrl = `http://localhost:8080/api/auth/tumblr/callback`;
+  const callbackUrl = process.env.TUMBLR_CALLBACK_URL;
   const state = crypto.randomBytes(16).toString("hex");
   req.session.oauthState = state;
 
@@ -29,7 +30,7 @@ export const getToken = async (req, res) => {
       new URLSearchParams({
         client_id: process.env.TUMBLR_CONSUMER_KEY,
         client_secret: process.env.TUMBLR_CONSUMER_SECRET,
-        redirect_uri: "http://localhost:8080/api/auth/tumblr/callback",
+        redirect_uri: process.env.TUMBLR_CALLBACK_URL,
         code: code,
         grant_type: "authorization_code",
       }),
@@ -57,42 +58,103 @@ export const getToken = async (req, res) => {
   }
 };
 
-
-export const schedulePostTumblr = async (req, res) => {
-  if (res.headersSent) return; 
-
-  const url = `https://api.tumblr.com/v2/blog/${req.body.username}/post`;
-  const { type: postType, media: mediaSources, accessToken } = req.body; 
-
-  const headers = { Authorization: `Bearer ${accessToken}` };
+const refreshAccessToken = async (refreshToken) => {
+  const url = 'https://api.tumblr.com/v2/oauth2/token';
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('client_id', process.env.TUMBLR_CONSUMER_KEY);
+  params.append('client_secret', process.env.TUMBLR_CONSUMER_SECRET);
+  params.append('refresh_token', refreshToken);
 
   try {
-    const formData = new FormData();
-    formData.append("type", postType);
-    formData.append("caption", req.body.caption || "Posting to Tumblr!");
-
-    switch (postType) {
-      case "photo":
-        await handlePhotoPost(req, formData);
-        break;
-      case "video":
-        await handleVideoPost(req, formData);
-        break;
-      case "text":
-        handleTextPost(req, formData);
-        break;
-      default:
-        throw new Error("Invalid post type. It must be either photo, video, or text.");
-    }
-
-    const response = await axios.post(url, formData, { headers: { ...headers, ...formData.getHeaders() } });
-    res.json({ message: `Successfully posted a ${postType} to Tumblr.`, response: response.data });
-
+    const response = await axios.post(url, params);
+    return response.data;
   } catch (error) {
-    const errorMessage = error.response ? JSON.stringify(error.response.data, null, 2) : error.message;
-    console.error("Failed to post to Tumblr:", errorMessage);
-    if (!res.headersSent) {
-      res.status(500).send(`Failed to post to Tumblr: ${errorMessage}`);
+    console.error('Failed to refresh access token:', error.message);
+    throw error;
+  }
+};
+
+export const schedulePostTumblr = async (req, res) => {
+  const { accessToken, media, type, tags, username, title, body, scheduledTime } = req.body;
+  
+  const scheduledDate = new Date(scheduledTime);
+
+  try {
+    const newSchedule = new Tumblr({
+      accessToken,
+      type,
+      scheduledTime: scheduledDate,
+      media,
+      tags, 
+      username,
+      title,
+      body,
+    });
+
+    await newSchedule.save();
+
+    res.status(201).send({ message: 'Tumblr scheduled successfully' });
+  } catch (error) {
+    console.error('Error scheduling Tumblr:', error);
+    res.status(500).send({ message: 'Error scheduling Tumblr', error: error.message });
+  }
+}
+
+
+export const checkAndPostScheduledTumblr = async () => {
+  const now = new Date();
+  const postsToPublish = await Tumblr.find({ scheduledTime: { $lte: now }, posted: false });
+
+  for (const post of postsToPublish) {
+    const { username, type, media, accessToken, refreshToken, title, body, tags } = post;
+    const url = `https://api.tumblr.com/v2/blog/${username}/post`;
+    let headers = { Authorization: `Bearer ${accessToken}` };
+
+    try {
+      const formData = new FormData();
+      formData.append("type", type);
+      formData.append("caption", body || "Posting to Tumblr!");
+
+      switch (type) {
+        case "photo":
+          await handlePhotoPost({ body: { media, tags } }, formData);
+          break;
+        case "video":
+          await handleVideoPost({ body: { media } }, formData);
+          break;
+        case "text":
+          handleTextPost({ body: { title, body } }, formData);
+          break;
+        default:
+          throw new Error("Invalid post type. It must be either photo, video, or text.");
+      }
+
+      const response = await axios.post(url, formData, { headers: { ...headers, ...formData.getHeaders() } });
+      post.posted = true;
+      await post.save();
+      console.log(`Successfully posted a ${type} to Tumblr.`, response.data);
+
+    } catch (error) {
+      if (error.response && error.response.status === 401 && error.response.data.error === 'invalid_token') {
+        try {
+          const newTokenData = await refreshAccessToken(refreshToken);
+          headers.Authorization = `Bearer ${newTokenData.access_token}`;
+          post.accessToken = newTokenData.access_token;
+          post.refreshToken = newTokenData.refresh_token || refreshToken;
+          await post.save();
+
+          // Retry the post request with the new access token
+          const retryResponse = await axios.post(url, formData, { headers: { ...headers, ...formData.getHeaders() } });
+          post.posted = true;
+          await post.save();
+          console.log(`Successfully posted a ${type} to Tumblr after refreshing token.`, retryResponse.data);
+        } catch (refreshError) {
+          console.error("Failed to refresh access token and post to Tumblr:", refreshError.message);
+        }
+      } else {
+        console.error("Failed to post to Tumblr:", error.message);
+      }
     }
   }
 };
