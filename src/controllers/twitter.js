@@ -85,7 +85,7 @@ const refreshAccessToken = async (refreshToken) => {
       throw new Error('Failed to refresh access token');
     }
 
-    await Twitter.updateOne({ refreshToken }, {
+    await Twitter.updateOne({ refreshToken }, { 
       accessToken: newTokenData.access_token,
       refreshToken: newTokenData.refresh_token || refreshToken,
     });
@@ -126,38 +126,40 @@ export const scheduleTwitter = async (req, res) => {
 const postTweet = async (tweet, twitterClient) => {
   let mediaIds = [];
 
-  for (let image of tweet.imageUrls) {
-    try {
-      const response = await axios.get(image.url, { responseType: 'arraybuffer' });
-      const buffer = Buffer.from(response.data, 'binary');
-      const mimeType = mime.lookup(image.url); 
+  if (tweet.imageUrls && tweet.imageUrls.length > 0) {
+    for (let image of tweet.imageUrls) {
+      try {
+        const response = await axios.get(image.url, { responseType: 'arraybuffer' });
+        const buffer = Buffer.from(response.data, 'binary');
+        const mimeType = mime.lookup(image.url); 
 
-      if (!mimeType) {
-        throw new Error(`Could not determine MIME type for URL ${image.url}`);
+        if (!mimeType) {
+          throw new Error(`Could not determine MIME type for URL ${image.url}`);
+        }
+
+        const mediaId = await twitterClient.v1.uploadMedia(buffer, { mimeType });
+        console.log(mediaId);
+        mediaIds.push(mediaId);
+      } catch (error) {
+        console.error(`Failed to upload media from URL ${image.url}:`, error);
       }
-
-      const mediaId = await twitterClient.v1.uploadMedia(buffer, { mimeType });
-      mediaIds.push(mediaId);
-    } catch (error) {
-      console.error(`Failed to upload media from URL ${image.url}:`, error);
     }
   }
 
-  if (mediaIds.length > 0) {
-    try {
-      await twitterClient.v2.tweet({
-        text: tweet.tweetContent,
-        media: {
-          media_ids: mediaIds,
-        },
-      });
-      await Twitter.findByIdAndUpdate(tweet._id, { posted: true });
-      console.log(`Tweet ID: ${tweet._id} has been posted.`);
-    } catch (error) {
-      console.error('Failed to post tweet:', error);
+  try {
+    const tweetData = {
+      text: tweet.tweetContent,
+    };
+
+    if (mediaIds.length > 0) {
+      tweetData.media = { media_ids: mediaIds };
     }
-  } else {
-    console.error('No media uploaded, tweet not posted.');
+
+    await twitterClient.v2.tweet(tweetData);
+    await Twitter.findByIdAndUpdate(tweet._id, { posted: true });
+    console.log(`Tweet ID: ${tweet._id} has been posted.`);
+  } catch (error) {
+    console.error('Failed to post tweet:', error);
   }
 };
 
@@ -167,7 +169,7 @@ export const postScheduledTweets = async (req, res) => {
   try {
     const tweetsToPost = await Twitter.find({
       scheduledTime: { $lte: now },
-      posted: false,
+      posted: false, 
     });
 
     for (const tweet of tweetsToPost) {
@@ -177,11 +179,12 @@ export const postScheduledTweets = async (req, res) => {
         accessToken: tweet.accessToken,
         accessSecret: tweet.refreshToken,
       });
+        
 
       try {
         await postTweet(tweet, twitterClient);
       } catch (error) {
-        if (error.response && error.response.status === 401 && error.response.data.error === 'invalid_token') {
+        if (error.response && error.response.status === 401 && error.response.data.errors.some(e => e.code === 89)) {
           try {
             const newTokenData = await refreshAccessToken(tweet.refreshToken);
             tweet.accessToken = newTokenData.access_token;
@@ -196,6 +199,7 @@ export const postScheduledTweets = async (req, res) => {
             });
 
             await postTweet(tweet, twitterClient);
+            console.log(`Successfully posted to Twitter after refreshing token.`);
           } catch (refreshError) {
             console.error("Failed to refresh access token and post to Twitter:", refreshError.message);
           }

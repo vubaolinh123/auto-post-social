@@ -30,7 +30,6 @@ const scheduleTumblr = new Schema({
     },
     refreshToken: {
         type: String,
-        required: true,
     },
     posted: { type: Boolean, default: false }
 }, { timestamps: true });
